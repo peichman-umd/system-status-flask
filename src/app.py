@@ -7,8 +7,7 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from flask import Flask
-from slimit.parser import Parser
-from slimit.visitors.nodevisitor import ASTVisitor
+from slimit.lexer import Lexer
 
 load_dotenv('../.env')
 STATUS_URL = os.environ.get('STATUS_URL')
@@ -16,20 +15,26 @@ STATUS_URL = os.environ.get('STATUS_URL')
 if STATUS_URL is None:
     raise RuntimeError('Must set STATUS_URL')
 
+
+def get_widget_html(text):
+    lexer.input(text)
+    for token in lexer:
+        if token.type == 'ID' and token.value == 'widgethtml':
+            # next two tokens should be a COLON and a STRING
+            _colon = lexer.token()
+            string = lexer.token()
+            if string.value.startswith('"<'):
+                return json.loads(string.value)
+
+
+def get_status_map(widget_html):
+    soup = BeautifulSoup(widget_html, 'html.parser')
+    products = soup.find_all(id=re.compile(r'product\d+'))
+    return {p.find('a').text.strip(): p.find(class_='s-la-product-status').text for p in products}
+
+
 app = Flask(__name__)
-
-
-class WidgetExtractor(ASTVisitor):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.widget_html = None
-
-    def visit_Object(self, node):
-        """Visit object literal nodes, looking for a "widgethtml" key with a value that looks like markup."""
-        for prop in node:
-            if prop.left.value == 'widgethtml' and prop.right.value.startswith('"<'):
-                # parse JSON string
-                self.widget_html = json.loads(prop.right.value)
+lexer = Lexer()
 
 
 @app.route('/')
@@ -40,18 +45,21 @@ def root():
 @app.route('/status')
 def get_status_counts():
     response = requests.get(STATUS_URL)
+    if not response.ok:
+        app.logger.error(f'Request to {STATUS_URL} returned {response.status_code} {response.reason}')
+        return {'error': 'Service Unavailable'}, 500
 
-    parser = Parser()
-    tree = parser.parse(response.text)
+    app.logger.debug(response.headers)
 
-    visitor = WidgetExtractor()
-    visitor.visit(tree)
-    soup = BeautifulSoup(visitor.widget_html, 'html.parser')
-    products = soup.find_all(id=re.compile(r'product\d+'))
-    status_map = {p.find('a').text.strip(): p.find(class_='s-la-product-status').text for p in products}
+    widget_html = get_widget_html(response.text)
+    if widget_html is None:
+        app.logger.error(f'Widget HTML could not be extracted from {STATUS_URL}')
+        return {'error': 'Service Unavailable'}, 500
+
+    status_map = get_status_map(widget_html)
 
     count = Counter()
-    for name, status in status_map.items():
+    for status in status_map.values():
         count[status] += 1
 
     total = len(status_map)
